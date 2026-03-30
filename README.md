@@ -1,4 +1,4 @@
-# RabbitMQ Retry and DLQ Sample
+# RabbitMQ Retry and DLQ Case Study
 
 This repository demonstrates a practical **Event-Driven Architecture (EDA)** sample using **Spring Boot microservices**, **RabbitMQ**, **retry**, and **Dead Letter Queue (DLQ)** handling.
 
