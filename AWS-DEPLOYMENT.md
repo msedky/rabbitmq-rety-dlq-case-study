@@ -94,26 +94,26 @@ Run all commands in the **same terminal session** so the variables persist. If y
 ---
 
 ## Phase 0 — Networking & Security Groups
-
-This phase creates **all** security groups up front (empty), then later phases add rules. This avoids the circular dependency where each tier's security group needs to reference another tier created later.
-
+ 
+This phase creates all four security groups first, then adds their rules. Run every command from here on in **Git Bash**, keeping the same terminal session open so the exported variables persist.
+ 
 ### 0.1 Capture VPC and Subnets
-
+ 
 ```bash
 export AWS_REGION=eu-west-1
-
+ 
 # Default VPC
 export VPC_ID=$(aws ec2 describe-vpcs \
   --filters "Name=isDefault,Values=true" \
   --query 'Vpcs[0].VpcId' --output text --region $AWS_REGION)
 echo "VPC_ID=$VPC_ID"
-
+ 
 # Two subnets in different AZs (ALB requires at least two)
 export SUBNET_IDS=$(aws ec2 describe-subnets \
   --filters "Name=vpc-id,Values=$VPC_ID" \
   --query 'Subnets[0:2].SubnetId' --output text --region $AWS_REGION)
 echo "SUBNET_IDS=$SUBNET_IDS"
-
+ 
 # Split into individual variables for later use
 export SUBNET_1=$(echo $SUBNET_IDS | awk '{print $1}')
 export SUBNET_2=$(echo $SUBNET_IDS | awk '{print $2}')
