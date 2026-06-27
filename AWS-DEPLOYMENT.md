@@ -55,11 +55,26 @@ flowchart TD
 ## Prerequisites
 
 - AWS account with sufficient permissions (or AdministratorAccess for initial setup)
-- AWS CLI installed and configured
+- **A bash shell.** This guide uses bash syntax throughout (`export`, `$VAR`, `\` line continuations). On Windows, use **Git Bash** (bundled with [Git for Windows](https://git-scm.com/download/win)) or WSL — the commands will not work as-is in CMD or PowerShell.
+- AWS CLI installed. Verify it's reachable from your shell:
+
+```bash
+aws --version
+```
+
+- Configure the CLI by running:
 
 ```bash
 aws configure
-# Enter: AWS Access Key ID, Secret Access Key, region (e.g. eu-west-1), output format (json)
+```
+
+This prompts you interactively for four values — type each one and press Enter:
+
+```
+AWS Access Key ID [None]: <your access key>
+AWS Secret Access Key [None]: <your secret key>
+Default region name [None]: eu-west-1
+Default output format [None]: json
 ```
 
 - Docker installed locally
