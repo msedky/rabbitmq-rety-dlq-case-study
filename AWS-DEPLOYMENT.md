@@ -1,931 +1,524 @@
-# AWS Deployment Guide — RabbitMQ Retry and DLQ Sample
+# AWS Deployment Guide
 
-This document covers deploying the `rabbitmq-rety-dlq-sample` project to AWS.
+This guide deploys the **RabbitMQ Retry and DLQ** sample to AWS using ECS Fargate, RDS, and Amazon MQ. The local Docker Compose setup is in [README.md](./README.md).
 
-The local setup (Docker Compose) is documented in [README.md](./README.md).
+**What this demonstrates:** containerizing Spring Boot microservices, pushing to a private registry (ECR), running them serverless on ECS Fargate behind an Application Load Balancer, with managed PostgreSQL (RDS), managed RabbitMQ (Amazon MQ), credentials in Secrets Manager, logs in CloudWatch, and a GitHub Actions CI/CD pipeline.
 
 ---
 
-## AWS Architecture
+## Architecture
 
 ```mermaid
 flowchart TD
-    Client[Client / Postman / Curl]
-    ALB[ALB - Application Load Balancer]
+    Client[Client / Postman]
+    ALB[Application Load Balancer]
 
     Client --> ALB
+    ALB -->|/api/v1/valid/*<br>/api/v1/malformed/*| Payment[payment-service<br>ECS Fargate]
+    ALB -->|/api/v1/invoices/*| Invoice[invoice-service<br>ECS Fargate]
 
-    ALB -->|/api/v1/valid/*<br>/api/v1/malformed/*| PaymentService[payment-service<br>ECS Fargate]
-    ALB -->|/api/v1/invoices/*| InvoiceService[invoice-service<br>ECS Fargate]
+    Payment --> PaymentDB[(RDS<br>payment_db)]
+    Invoice --> InvoiceDB[(RDS<br>invoice_db)]
 
-    PaymentService --> PaymentDB[(RDS<br>payment_db)]
-    InvoiceService --> InvoiceDB[(RDS<br>invoice_db)]
+    Payment -->|publishes| MQ[Amazon MQ<br>RabbitMQ]
+    Invoice -->|consumes| MQ
 
-    PaymentService -->|publishes events| MQ[Amazon MQ<br>RabbitMQ broker<br>shared by both services]
-    InvoiceService -->|consumes events| MQ
-
-    subgraph CICD[CI/CD - GitHub Actions]
-        direction LR
-        ECRPayment[ECR<br>payment image]
-        ECRInvoice[ECR<br>invoice image]
-        Deploy[ECS deploy<br>force new deployment]
-    end
-
-    CICD -.->|deploys| PaymentService
-    CICD -.->|deploys| InvoiceService
+    GHA[GitHub Actions] -.->|build, push, deploy| Payment
+    GHA -.->|build, push, deploy| Invoice
 ```
 
-## AWS Services Used
-
-| Service | Purpose |
+| AWS service | Role |
 |---|---|
-| **ECR** | Container registry for Docker images |
-| **ECS Fargate** | Serverless container runtime |
-| **RDS PostgreSQL** | Managed databases for payment_db and invoice_db |
-| **Amazon MQ** | Managed RabbitMQ broker |
-| **ALB** | Application Load Balancer — routes traffic to each service |
-| **Secrets Manager** | Stores RDS and Amazon MQ credentials securely |
-| **IAM** | Task execution roles with least-privilege permissions |
-| **VPC** | Network isolation — security groups scoped per tier |
-| **CloudWatch** | Centralized logs for both services |
-| **GitHub Actions** | CI/CD pipeline — build, push to ECR, deploy to ECS |
+| ECR | Stores the two Docker images |
+| ECS Fargate | Runs the containers (serverless) |
+| RDS PostgreSQL | `payment_db` and `invoice_db` |
+| Amazon MQ | Shared RabbitMQ broker |
+| ALB | Routes HTTP traffic to each service by path |
+| Secrets Manager | DB and broker passwords |
+| CloudWatch | Application logs |
+| GitHub Actions | CI/CD pipeline |
 
 ---
 
-## Prerequisites
+## Before You Start
 
-- AWS account with sufficient permissions (or AdministratorAccess for initial setup)
-- **A bash shell.** This guide uses bash syntax throughout (`export`, `$VAR`, `\` line continuations). On Windows, use **Git Bash** (bundled with [Git for Windows](https://git-scm.com/download/win)) or WSL — the commands will not work as-is in CMD or PowerShell.
-- AWS CLI installed. Verify it's reachable from your shell:
+- An AWS account, and the [AWS CLI](https://aws.amazon.com/cli/) installed.
+- A **bash shell**. On Windows use **Git Bash** (bundled with [Git for Windows](https://git-scm.com/download/win)) — the commands below will not run in CMD or PowerShell.
+- Docker installed locally.
 
-```bash
-aws --version
-```
-
-- Configure the CLI by running:
+Configure the CLI (fill the four prompts interactively):
 
 ```bash
 aws configure
+#   AWS Access Key ID:      <your key>
+#   AWS Secret Access Key:  <your secret>
+#   Default region name:    eu-west-1
+#   Default output format:  json
 ```
 
-This prompts you interactively for four values — type each one and press Enter:
-
-```
-AWS Access Key ID [None]: <your access key>
-AWS Secret Access Key [None]: <your secret key>
-Default region name [None]: eu-west-1
-Default output format [None]: json
-```
-
-- Docker installed locally
-- GitHub repository with the project pushed
-
-### A Note on This Guide's Approach
-
-Every phase below **captures resource IDs into shell variables** (e.g. `VPC_ID`, `ECS_SG_ID`) and references them by ID, not by name. This matters because:
-
-- In a real (non-default) VPC, security group rules **must** reference other groups by ID, not by name.
-- It makes the commands copy-paste safe in a single terminal session.
-
-> **Network design choice:** For simplicity and to keep this a low-cost portfolio deployment, ECS tasks and RDS run in the VPC's **public subnets** with tasks assigned public IPs. This avoids needing a NAT gateway (which costs ~$32/month) for tasks to reach ECR and Secrets Manager. Security is still enforced by security groups — nothing is open to the internet except the ALB on port 80. The production-grade alternative (private subnets + NAT gateway or VPC endpoints) is noted at the end.
-
-### Resuming in a New Terminal Session
-
-Exported shell variables do **not** survive closing the terminal. If you continue the deployment in a fresh Git Bash window, paste this block first to restore every variable by looking up resources that already exist. It is safe to run at any point — it only reads, never creates.
+Set the three values reused throughout. Keep this terminal open while you work; if you return later in a new window, see [Resuming Later](#resuming-later).
 
 ```bash
 export AWS_REGION=eu-west-1
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 export ECR_REGISTRY=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-
-# VPC + subnets
-export VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" \
-  --query 'Vpcs[0].VpcId' --output text --region $AWS_REGION)
-export SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" \
-  --query 'Subnets[0:2].SubnetId' --output text --region $AWS_REGION)
-export SUBNET_1=$(echo $SUBNET_IDS | awk '{print $1}')
-export SUBNET_2=$(echo $SUBNET_IDS | awk '{print $2}')
-
-# Security groups (by name)
-sg_id () { aws ec2 describe-security-groups \
-  --filters "Name=group-name,Values=$1" "Name=vpc-id,Values=$VPC_ID" \
-  --query 'SecurityGroups[0].GroupId' --output text --region $AWS_REGION; }
-export ALB_SG_ID=$(sg_id retry-dlq-alb-sg)
-export ECS_SG_ID=$(sg_id retry-dlq-ecs-sg)
-export RDS_SG_ID=$(sg_id retry-dlq-rds-sg)
-export MQ_SG_ID=$(sg_id retry-dlq-mq-sg)
-
-# RDS + MQ endpoints (only resolve once those resources exist; otherwise blank)
-export PAYMENT_DB_ENDPOINT=$(aws rds describe-db-instances --db-instance-identifier payment-db \
-  --query 'DBInstances[0].Endpoint.Address' --output text --region $AWS_REGION 2>/dev/null)
-export INVOICE_DB_ENDPOINT=$(aws rds describe-db-instances --db-instance-identifier invoice-db \
-  --query 'DBInstances[0].Endpoint.Address' --output text --region $AWS_REGION 2>/dev/null)
-export BROKER_ID=$(aws mq list-brokers \
-  --query "BrokerSummaries[?BrokerName=='rabbitmq-retry-dlq-broker'].BrokerId" \
-  --output text --region $AWS_REGION 2>/dev/null)
-
-echo "Restored. VPC, subnets, and SG variables should now be set."
 ```
 
-Verify nothing came back empty (prints `ok` / `EMPTY` only, reveals no IDs):
-
-```bash
-for v in AWS_REGION VPC_ID SUBNET_1 SUBNET_2 ALB_SG_ID ECS_SG_ID RDS_SG_ID MQ_SG_ID; do
-  eval "val=\$$v"; [ -n "$val" ] && echo "$v ok" || echo "$v EMPTY"
-done
-```
-
-`PAYMENT_DB_ENDPOINT`, `INVOICE_DB_ENDPOINT`, and `BROKER_ID` will be empty until you have completed Phases 2 and 3 — that is expected if you are resuming earlier than those phases.
+> **Cost note:** This uses public subnets so containers can reach AWS services without a NAT gateway (~$32/month saved). Nothing is internet-exposed except the load balancer. Remember to run [Teardown](#teardown) when finished — RDS and Amazon MQ bill hourly.
 
 ---
 
-## Phase 0 — Networking & Security Groups
+## Phase 1 — Network & Security Groups
 
-This phase creates all four security groups first, then adds their rules.
-
-### 0.1 Capture VPC and Subnets
+Find the default VPC and two subnets, then create one security group per tier.
 
 ```bash
-export AWS_REGION=eu-west-1
-
-# Default VPC
-export VPC_ID=$(aws ec2 describe-vpcs \
-  --filters "Name=isDefault,Values=true" \
-  --query 'Vpcs[0].VpcId' --output text --region $AWS_REGION)
-echo "VPC_ID=$VPC_ID"
-
-# Two subnets in different AZs (ALB requires at least two)
-export SUBNET_IDS=$(aws ec2 describe-subnets \
-  --filters "Name=vpc-id,Values=$VPC_ID" \
-  --query 'Subnets[0:2].SubnetId' --output text --region $AWS_REGION)
-echo "SUBNET_IDS=$SUBNET_IDS"
-
-# Split into individual variables for later use
-export SUBNET_1=$(echo $SUBNET_IDS | awk '{print $1}')
-export SUBNET_2=$(echo $SUBNET_IDS | awk '{print $2}')
-echo "SUBNET_1=$SUBNET_1  SUBNET_2=$SUBNET_2"
+export VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" \
+  --query 'Vpcs[0].VpcId' --output text)
+export SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" \
+  --query 'Subnets[0:2].SubnetId' --output text)
+export SUBNET_1=$(echo $SUBNETS | cut -d' ' -f1)
+export SUBNET_2=$(echo $SUBNETS | cut -d' ' -f2)
 ```
 
-### 0.2 Create All Security Groups (empty)
-
-The helper below creates a group only if one with that name does not already exist, and returns its ID either way. This makes the step **safe to re-run** — running it twice will not create duplicate groups.
+Create the four security groups. The helper returns an existing group's ID instead of failing, so this is safe to re-run.
 
 ```bash
-# Helper: get the ID of a security group by name, or create it if missing
-ensure_sg () {
-  local name="$1" desc="$2" id
-  id=$(aws ec2 describe-security-groups \
-        --filters "Name=group-name,Values=$name" "Name=vpc-id,Values=$VPC_ID" \
-        --query 'SecurityGroups[0].GroupId' --output text --region $AWS_REGION 2>/dev/null)
-  if [ "$id" = "None" ] || [ -z "$id" ]; then
-    id=$(aws ec2 create-security-group \
-          --group-name "$name" --description "$desc" \
-          --vpc-id $VPC_ID --query 'GroupId' --output text --region $AWS_REGION)
-  fi
+sg () {
+  local id=$(aws ec2 describe-security-groups \
+    --filters "Name=group-name,Values=$1" "Name=vpc-id,Values=$VPC_ID" \
+    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)
+  [ "$id" = "None" ] || [ -z "$id" ] && \
+    id=$(aws ec2 create-security-group --group-name "$1" --description "$1" \
+      --vpc-id $VPC_ID --query 'GroupId' --output text)
   echo "$id"
 }
 
-export ALB_SG_ID=$(ensure_sg retry-dlq-alb-sg "ALB for rabbitmq-retry-dlq")
-export ECS_SG_ID=$(ensure_sg retry-dlq-ecs-sg "ECS tasks for rabbitmq-retry-dlq")
-export RDS_SG_ID=$(ensure_sg retry-dlq-rds-sg "RDS for rabbitmq-retry-dlq")
-export MQ_SG_ID=$(ensure_sg  retry-dlq-mq-sg  "Amazon MQ for rabbitmq-retry-dlq")
-
-echo "ALB_SG_ID=$ALB_SG_ID"
-echo "ECS_SG_ID=$ECS_SG_ID"
-echo "RDS_SG_ID=$RDS_SG_ID"
-echo "MQ_SG_ID=$MQ_SG_ID"
+export ALB_SG=$(sg retry-dlq-alb-sg)
+export ECS_SG=$(sg retry-dlq-ecs-sg)
+export RDS_SG=$(sg retry-dlq-rds-sg)
+export MQ_SG=$(sg  retry-dlq-mq-sg)
 ```
 
-All four lines should print a `sg-...` value. If any prints `None` or is blank, stop and re-check `$VPC_ID` before continuing.
-
-### 0.3 Add Security Group Rules
-
-If you re-run any of these and the rule already exists, AWS returns an `InvalidPermission.Duplicate` error for that line and changes nothing — that is harmless.
+Add the rules (duplicate-rule errors on re-run are harmless):
 
 ```bash
-# ALB: allow HTTP from the internet
-aws ec2 authorize-security-group-ingress \
-  --group-id $ALB_SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0 --region $AWS_REGION
-
-# ECS tasks: allow 8081 and 8082 from the ALB only
-aws ec2 authorize-security-group-ingress \
-  --group-id $ECS_SG_ID --protocol tcp --port 8081 --source-group $ALB_SG_ID --region $AWS_REGION
-aws ec2 authorize-security-group-ingress \
-  --group-id $ECS_SG_ID --protocol tcp --port 8082 --source-group $ALB_SG_ID --region $AWS_REGION
-
-# RDS: allow 5432 from ECS tasks only
-aws ec2 authorize-security-group-ingress \
-  --group-id $RDS_SG_ID --protocol tcp --port 5432 --source-group $ECS_SG_ID --region $AWS_REGION
-
-# Amazon MQ: allow 5671 (AMQPS) from ECS tasks only
-aws ec2 authorize-security-group-ingress \
-  --group-id $MQ_SG_ID --protocol tcp --port 5671 --source-group $ECS_SG_ID --region $AWS_REGION
+# ALB: HTTP from anywhere
+aws ec2 authorize-security-group-ingress --group-id $ALB_SG --protocol tcp --port 80 --cidr 0.0.0.0/0
+# ECS: app ports from the ALB only
+aws ec2 authorize-security-group-ingress --group-id $ECS_SG --protocol tcp --port 8081 --source-group $ALB_SG
+aws ec2 authorize-security-group-ingress --group-id $ECS_SG --protocol tcp --port 8082 --source-group $ALB_SG
+# RDS: Postgres from ECS only
+aws ec2 authorize-security-group-ingress --group-id $RDS_SG --protocol tcp --port 5432 --source-group $ECS_SG
+# MQ: AMQPS from ECS only
+aws ec2 authorize-security-group-ingress --group-id $MQ_SG  --protocol tcp --port 5671 --source-group $ECS_SG
 ```
 
-### 0.4 Verify the Rules
-
-Confirm each group has the expected port before moving on:
+**Verify:** all four should print a `sg-...` value.
 
 ```bash
-echo "ALB (expect 80):   $(aws ec2 describe-security-groups --group-ids $ALB_SG_ID --query 'SecurityGroups[0].IpPermissions[].FromPort' --output text --region $AWS_REGION)"
-echo "ECS (expect 8081 8082): $(aws ec2 describe-security-groups --group-ids $ECS_SG_ID --query 'SecurityGroups[0].IpPermissions[].FromPort' --output text --region $AWS_REGION)"
-echo "RDS (expect 5432): $(aws ec2 describe-security-groups --group-ids $RDS_SG_ID --query 'SecurityGroups[0].IpPermissions[].FromPort' --output text --region $AWS_REGION)"
-echo "MQ  (expect 5671): $(aws ec2 describe-security-groups --group-ids $MQ_SG_ID --query 'SecurityGroups[0].IpPermissions[].FromPort' --output text --region $AWS_REGION)"
-```
-
-If a line shows its expected port(s), that group is correctly configured. A blank value means the rule did not apply — re-run the matching command in 0.3 (and check that the variable is not empty with `echo $ECS_SG_ID`).
-
----
-
-## Phase 1 — ECR: Container Registry
-
-### 1.1 Create ECR Repositories
-
-```bash
-export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export ECR_REGISTRY=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-
-aws ecr create-repository \
-  --repository-name rabbitmq-retry-dlq/payment-service \
-  --region $AWS_REGION
-
-aws ecr create-repository \
-  --repository-name rabbitmq-retry-dlq/invoice-service \
-  --region $AWS_REGION
-```
-
-### 1.2 Authenticate Docker to ECR
-
-```bash
-aws ecr get-login-password --region $AWS_REGION | \
-  docker login --username AWS --password-stdin $ECR_REGISTRY
-```
-
-### 1.3 Build and Push Images (manual first push)
-
-A first manual push is required because the ECS task definitions in Phase 5 reference the `:latest` image — it must exist before the services can start.
-
-```bash
-# payment-service
-docker build -t $ECR_REGISTRY/rabbitmq-retry-dlq/payment-service:latest ./payment-service
-docker push $ECR_REGISTRY/rabbitmq-retry-dlq/payment-service:latest
-
-# invoice-service
-docker build -t $ECR_REGISTRY/rabbitmq-retry-dlq/invoice-service:latest ./invoice-service
-docker push $ECR_REGISTRY/rabbitmq-retry-dlq/invoice-service:latest
+echo "$ALB_SG $ECS_SG $RDS_SG $MQ_SG"
 ```
 
 ---
 
-## Phase 2 — RDS: Managed PostgreSQL
+## Phase 2 — ECR & Images
 
-Create two RDS instances — one per service database.
-
-> **Engine version:** `--engine-version` must be a full minor version (e.g. `16.4`), not just `16`. List the versions available in your region first and pick one:
-> ```bash
-> aws rds describe-db-engine-versions --engine postgres \
->   --query 'DBEngineVersions[].EngineVersion' --output text --region $AWS_REGION
-> ```
-> Set it once: `export PG_VERSION=16.4` (replace with a value from the list above).
-
-### 2.1 Create payment_db
+Create a repository per service and push the first image (ECS needs `:latest` to exist before it can start).
 
 ```bash
-aws rds create-db-instance \
-  --db-instance-identifier payment-db \
-  --db-instance-class db.t3.micro \
-  --engine postgres \
-  --engine-version $PG_VERSION \
-  --master-username postgres \
-  --master-user-password "<your-rds-password>" \
-  --db-name payment_db \
-  --allocated-storage 20 \
-  --vpc-security-group-ids $RDS_SG_ID \
-  --no-publicly-accessible \
-  --region $AWS_REGION
+aws ecr create-repository --repository-name retry-dlq/payment-service
+aws ecr create-repository --repository-name retry-dlq/invoice-service
+
+aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REGISTRY
+
+docker build -t $ECR_REGISTRY/retry-dlq/payment-service:latest ./payment-service
+docker push  $ECR_REGISTRY/retry-dlq/payment-service:latest
+
+docker build -t $ECR_REGISTRY/retry-dlq/invoice-service:latest ./invoice-service
+docker push  $ECR_REGISTRY/retry-dlq/invoice-service:latest
 ```
 
-### 2.2 Create invoice_db
+**Verify:** both images are listed.
 
 ```bash
-aws rds create-db-instance \
-  --db-instance-identifier invoice-db \
-  --db-instance-class db.t3.micro \
-  --engine postgres \
-  --engine-version $PG_VERSION \
-  --master-username postgres \
-  --master-user-password "<your-rds-password>" \
-  --db-name invoice_db \
-  --allocated-storage 20 \
-  --vpc-security-group-ids $RDS_SG_ID \
-  --no-publicly-accessible \
-  --region $AWS_REGION
+aws ecr list-images --repository-name retry-dlq/payment-service --query 'imageIds[].imageTag' --output text
+aws ecr list-images --repository-name retry-dlq/invoice-service --query 'imageIds[].imageTag' --output text
 ```
-
-> **Subnet placement:** Without `--db-subnet-group-name`, RDS uses the default subnet group (all subnets in the default VPC). The `--no-publicly-accessible` flag ensures the instance has no public IP, so it is only reachable from inside the VPC — which is what the RDS security group enforces.
-
-### 2.3 Note the Endpoints
-
-Instances take ~5 minutes to become available. Capture the endpoints once ready:
-
-```bash
-export PAYMENT_DB_ENDPOINT=$(aws rds describe-db-instances \
-  --db-instance-identifier payment-db \
-  --query 'DBInstances[0].Endpoint.Address' --output text --region $AWS_REGION)
-
-export INVOICE_DB_ENDPOINT=$(aws rds describe-db-instances \
-  --db-instance-identifier invoice-db \
-  --query 'DBInstances[0].Endpoint.Address' --output text --region $AWS_REGION)
-
-echo "PAYMENT_DB_ENDPOINT=$PAYMENT_DB_ENDPOINT"
-echo "INVOICE_DB_ENDPOINT=$INVOICE_DB_ENDPOINT"
-```
-
-> If the value comes back empty, the instance isn't ready yet. Check status with:
-> `aws rds describe-db-instances --db-instance-identifier payment-db --query 'DBInstances[0].DBInstanceStatus' --output text`
 
 ---
 
-## Phase 3 — Amazon MQ: Managed RabbitMQ
+## Phase 3 — RDS (PostgreSQL)
 
-### 3.1 Create the Broker
+`--engine-version` needs a real minor version. List what's available and pick one:
 
-> **Engine version:** RabbitMQ versions supported by Amazon MQ change over time. List the valid versions first:
-> ```bash
-> aws mq describe-broker-engine-types --engine-type RABBITMQ \
->   --query 'BrokerEngineTypes[0].EngineVersions[].Name' --output text --region $AWS_REGION
-> ```
-> Set it: `export MQ_VERSION=3.13.x` (replace with a value from the list).
+```bash
+aws rds describe-db-engine-versions --engine postgres \
+  --query 'DBEngineVersions[].EngineVersion' --output text
+export PG=16.4   # replace with a value from the list
+```
+
+Create both databases (replace the password):
+
+```bash
+for db in payment invoice; do
+  aws rds create-db-instance \
+    --db-instance-identifier ${db}-db \
+    --db-instance-class db.t3.micro \
+    --engine postgres --engine-version $PG \
+    --master-username postgres --master-user-password "<your-db-password>" \
+    --db-name ${db}_db --allocated-storage 20 \
+    --vpc-security-group-ids $RDS_SG --no-publicly-accessible
+done
+```
+
+Databases take ~5 minutes. **Verify** both report `available`:
+
+```bash
+aws rds describe-db-instances --query 'DBInstances[].[DBInstanceIdentifier,DBInstanceStatus]' --output text
+```
+
+---
+
+## Phase 4 — Amazon MQ (RabbitMQ)
+
+Pick a supported engine version:
+
+```bash
+aws mq describe-broker-engine-types --engine-type RABBITMQ \
+  --query 'BrokerEngineTypes[0].EngineVersions[].Name' --output text
+export MQ_VERSION=3.13.2   # replace with a value from the list
+```
+
+Create the broker (replace the password):
 
 ```bash
 aws mq create-broker \
-  --broker-name rabbitmq-retry-dlq-broker \
-  --engine-type RABBITMQ \
-  --engine-version $MQ_VERSION \
-  --deployment-mode SINGLE_INSTANCE \
-  --host-instance-type mq.t3.micro \
-  --no-publicly-accessible \
-  --security-groups $MQ_SG_ID \
-  --subnet-ids $SUBNET_1 \
-  --users "Username=mquser,Password=<your-mq-password>,ConsoleAccess=true" \
-  --region $AWS_REGION
+  --broker-name retry-dlq-broker \
+  --engine-type RABBITMQ --engine-version $MQ_VERSION \
+  --deployment-mode SINGLE_INSTANCE --host-instance-type mq.t3.micro \
+  --no-publicly-accessible --security-groups $MQ_SG --subnet-ids $SUBNET_1 \
+  --users "Username=mquser,Password=<your-mq-password>,ConsoleAccess=true"
 ```
 
-Capture the broker ID from the output:
+The broker takes a few minutes. **Verify** it reports `RUNNING`:
 
 ```bash
-export BROKER_ID=$(aws mq list-brokers \
-  --query "BrokerSummaries[?BrokerName=='rabbitmq-retry-dlq-broker'].BrokerId" \
-  --output text --region $AWS_REGION)
-echo "BROKER_ID=$BROKER_ID"
+aws mq list-brokers --query 'BrokerSummaries[].[BrokerName,BrokerState]' --output text
 ```
-
-> `SINGLE_INSTANCE` is sufficient for a portfolio project and is the most cost-effective option. A single-instance broker uses one subnet; `ACTIVE_STANDBY_MULTI_AZ` would require two.
-
-### 3.2 Retrieve the Broker Endpoint
-
-The broker takes a few minutes to provision. Once `RUNNING`, capture the AMQPS endpoint host:
-
-```bash
-# Full endpoint looks like: amqps://b-xxxx.mq.eu-west-1.amazonaws.com:5671
-# Spring needs only the host part, so we strip the scheme and port.
-export MQ_ENDPOINT=$(aws mq describe-broker --broker-id $BROKER_ID \
-  --query 'BrokerInstances[0].Endpoints[0]' --output text --region $AWS_REGION \
-  | sed -E 's#amqps://##; s#:5671##')
-echo "MQ_ENDPOINT=$MQ_ENDPOINT"
-```
-
-The RabbitMQ Management UI (Console URL, port 443) is also listed under `BrokerInstances[0].ConsoleURL`.
-
-### 3.3 SSL Configuration Note
-
-Amazon MQ enforces TLS on port 5671 (there is no plaintext 5672). The services must connect with SSL enabled. This is handled via the environment variables already set in the Phase 5 task definitions:
-
-```
-SPRING_RABBITMQ_PORT=5671
-SPRING_RABBITMQ_SSL_ENABLED=true
-```
-
-No application code change is required — these override the `application.properties` values at runtime. (Locally, Docker Compose runs RabbitMQ without TLS, which is why this is set only for AWS.)
 
 ---
 
-## Phase 4 — Secrets Manager: Secure Credentials
+## Phase 5 — Secrets Manager
 
-Store sensitive values in AWS Secrets Manager instead of plain environment variables.
-
-### 4.1 Store RDS Passwords
+Store the three credentials. ECS reads these at container start.
 
 ```bash
-aws secretsmanager create-secret \
-  --name rabbitmq-retry-dlq/payment-db-password \
-  --secret-string '{"password":"<your-rds-password>"}' \
-  --region $AWS_REGION
-
-aws secretsmanager create-secret \
-  --name rabbitmq-retry-dlq/invoice-db-password \
-  --secret-string '{"password":"<your-rds-password>"}' \
-  --region $AWS_REGION
+aws secretsmanager create-secret --name retry-dlq/payment-db \
+  --secret-string '{"password":"<your-db-password>"}'
+aws secretsmanager create-secret --name retry-dlq/invoice-db \
+  --secret-string '{"password":"<your-db-password>"}'
+aws secretsmanager create-secret --name retry-dlq/mq \
+  --secret-string '{"username":"mquser","password":"<your-mq-password>"}'
 ```
 
-### 4.2 Store Amazon MQ Credentials
+Create an IAM policy granting read access to just these secrets:
 
 ```bash
-aws secretsmanager create-secret \
-  --name rabbitmq-retry-dlq/mq-credentials \
-  --secret-string '{"username":"mquser","password":"<your-mq-password>"}' \
-  --region $AWS_REGION
-```
-
-### 4.3 IAM Policy for ECS Task Role
-
-Create `secrets-policy.json`:
-
-```json
+cat > secrets-policy.json << EOF
 {
   "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["secretsmanager:GetSecretValue"],
-      "Resource": [
-        "arn:aws:secretsmanager:eu-west-1:<account-id>:secret:rabbitmq-retry-dlq/*"
-      ]
-    }
-  ]
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["secretsmanager:GetSecretValue"],
+    "Resource": "arn:aws:secretsmanager:${AWS_REGION}:${ACCOUNT_ID}:secret:retry-dlq/*"
+  }]
 }
+EOF
+
+export SECRETS_POLICY=$(aws iam create-policy --policy-name retry-dlq-secrets \
+  --policy-document file://secrets-policy.json --query 'Policy.Arn' --output text)
 ```
-
-> Replace `<account-id>` with your real account ID, or generate the file dynamically:
-> ```bash
-> sed "s/<account-id>/$ACCOUNT_ID/" secrets-policy.template.json > secrets-policy.json
-> ```
-
-```bash
-export SECRETS_POLICY_ARN=$(aws iam create-policy \
-  --policy-name rabbitmq-retry-dlq-secrets-policy \
-  --policy-document file://secrets-policy.json \
-  --query 'Policy.Arn' --output text)
-echo "SECRETS_POLICY_ARN=$SECRETS_POLICY_ARN"
-```
-
-This policy is attached to the ECS task role in the next phase.
 
 ---
 
-## Phase 5 — ECS Fargate: Container Runtime
+## Phase 6 — ECS Fargate
 
-### 5.1 Create the CloudWatch Log Groups
-
-The `awslogs` driver does **not** auto-create log groups unless told to. Create them up front so the services don't fail on first boot:
+### 6.1 Cluster, log groups, and execution role
 
 ```bash
-aws logs create-log-group --log-group-name /ecs/rabbitmq-retry-dlq/payment-service --region $AWS_REGION
-aws logs create-log-group --log-group-name /ecs/rabbitmq-retry-dlq/invoice-service --region $AWS_REGION
-```
+aws ecs create-cluster --cluster-name retry-dlq
 
-> Alternatively, add `"awslogs-create-group": "true"` to each task definition's log options (also included below).
+aws logs create-log-group --log-group-name /ecs/retry-dlq/payment-service
+aws logs create-log-group --log-group-name /ecs/retry-dlq/invoice-service
 
-### 5.2 Create the ECS Cluster
+aws iam create-role --role-name retry-dlq-exec \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
-```bash
-aws ecs create-cluster \
-  --cluster-name rabbitmq-retry-dlq-cluster \
-  --region $AWS_REGION
-```
-
-### 5.3 Create IAM Task Execution Role
-
-```bash
-aws iam create-role \
-  --role-name ecsTaskExecutionRole-retry-dlq \
-  --assume-role-policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Principal": {"Service": "ecs-tasks.amazonaws.com"},
-      "Action": "sts:AssumeRole"
-    }]
-  }'
-
-# Attach the AWS managed policy for ECS task execution (ECR pull, CloudWatch logs)
-aws iam attach-role-policy \
-  --role-name ecsTaskExecutionRole-retry-dlq \
+aws iam attach-role-policy --role-name retry-dlq-exec \
   --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-
-# Attach the custom secrets policy from Phase 4
-aws iam attach-role-policy \
-  --role-name ecsTaskExecutionRole-retry-dlq \
-  --policy-arn $SECRETS_POLICY_ARN
+aws iam attach-role-policy --role-name retry-dlq-exec --policy-arn $SECRETS_POLICY
 ```
 
-> **Why this role needs the secrets policy:** ECS reads `secrets` entries in the task definition *before* the container starts, using the **execution** role. That's why the secrets policy is attached here, not to a separate task role.
-
-### 5.4 Create Task Definition — payment-service
-
-Generate `payment-service-task-def.json` (using the variables captured earlier so you don't hand-edit placeholders):
+### 6.2 Capture the RDS and MQ endpoints
 
 ```bash
-cat > payment-service-task-def.json << EOF
+export PAYMENT_DB=$(aws rds describe-db-instances --db-instance-identifier payment-db \
+  --query 'DBInstances[0].Endpoint.Address' --output text)
+export INVOICE_DB=$(aws rds describe-db-instances --db-instance-identifier invoice-db \
+  --query 'DBInstances[0].Endpoint.Address' --output text)
+export BROKER_ID=$(aws mq list-brokers \
+  --query "BrokerSummaries[?BrokerName=='retry-dlq-broker'].BrokerId" --output text)
+export MQ_HOST=$(aws mq describe-broker --broker-id $BROKER_ID \
+  --query 'BrokerInstances[0].Endpoints[0]' --output text | sed -E 's#amqps://##; s#:5671##')
+```
+
+### 6.3 Register the task definitions
+
+```bash
+for svc in payment invoice; do
+  if [ "$svc" = "payment" ]; then PORT=8081; DB=$PAYMENT_DB; DBNAME=payment_db; EXTRA=""; else
+    PORT=8082; DB=$INVOICE_DB; DBNAME=invoice_db
+    EXTRA='{"name":"SPRING_RABBITMQ_LISTENER_SIMPLE_DEFAULT_REQUEUE_REJECTED","value":"false"},
+           {"name":"APP_RETRY_INVOICE_MAX_ATTEMPTS","value":"3"},
+           {"name":"APP_RETRY_INVOICE_DELAY","value":"1000"},
+           {"name":"APP_RETRY_INVOICE_MULTIPLIER","value":"1.0"},
+           {"name":"APP_RETRY_INVOICE_MAX_DELAY","value":"1000"},'
+  fi
+
+  cat > ${svc}-task.json << EOF
 {
-  "family": "payment-service",
+  "family": "${svc}-service",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
-  "cpu": "256",
-  "memory": "512",
-  "executionRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/ecsTaskExecutionRole-retry-dlq",
-  "containerDefinitions": [
-    {
-      "name": "payment-service",
-      "image": "${ECR_REGISTRY}/rabbitmq-retry-dlq/payment-service:latest",
-      "portMappings": [{"containerPort": 8081, "protocol": "tcp"}],
-      "environment": [
-        {"name": "SPRING_DATASOURCE_URL", "value": "jdbc:postgresql://${PAYMENT_DB_ENDPOINT}:5432/payment_db"},
-        {"name": "SPRING_DATASOURCE_USERNAME", "value": "postgres"},
-        {"name": "SPRING_RABBITMQ_HOST", "value": "${MQ_ENDPOINT}"},
-        {"name": "SPRING_RABBITMQ_PORT", "value": "5671"},
-        {"name": "SPRING_RABBITMQ_SSL_ENABLED", "value": "true"}
-      ],
-      "secrets": [
-        {"name": "SPRING_DATASOURCE_PASSWORD", "valueFrom": "arn:aws:secretsmanager:${AWS_REGION}:${ACCOUNT_ID}:secret:rabbitmq-retry-dlq/payment-db-password:password::"},
-        {"name": "SPRING_RABBITMQ_USERNAME", "valueFrom": "arn:aws:secretsmanager:${AWS_REGION}:${ACCOUNT_ID}:secret:rabbitmq-retry-dlq/mq-credentials:username::"},
-        {"name": "SPRING_RABBITMQ_PASSWORD", "valueFrom": "arn:aws:secretsmanager:${AWS_REGION}:${ACCOUNT_ID}:secret:rabbitmq-retry-dlq/mq-credentials:password::"}
-      ],
-      "logConfiguration": {
-        "logDriver": "awslogs",
-        "options": {
-          "awslogs-group": "/ecs/rabbitmq-retry-dlq/payment-service",
-          "awslogs-region": "${AWS_REGION}",
-          "awslogs-stream-prefix": "ecs",
-          "awslogs-create-group": "true"
-        }
+  "cpu": "256", "memory": "512",
+  "executionRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/retry-dlq-exec",
+  "containerDefinitions": [{
+    "name": "${svc}-service",
+    "image": "${ECR_REGISTRY}/retry-dlq/${svc}-service:latest",
+    "portMappings": [{"containerPort": ${PORT}}],
+    "environment": [
+      {"name":"SPRING_DATASOURCE_URL","value":"jdbc:postgresql://${DB}:5432/${DBNAME}"},
+      {"name":"SPRING_DATASOURCE_USERNAME","value":"postgres"},
+      {"name":"SPRING_RABBITMQ_HOST","value":"${MQ_HOST}"},
+      {"name":"SPRING_RABBITMQ_PORT","value":"5671"},
+      {"name":"SPRING_RABBITMQ_SSL_ENABLED","value":"true"},
+      ${EXTRA}
+      {"name":"_PLACEHOLDER","value":"ignore"}
+    ],
+    "secrets": [
+      {"name":"SPRING_DATASOURCE_PASSWORD","valueFrom":"arn:aws:secretsmanager:${AWS_REGION}:${ACCOUNT_ID}:secret:retry-dlq/${svc}-db:password::"},
+      {"name":"SPRING_RABBITMQ_USERNAME","valueFrom":"arn:aws:secretsmanager:${AWS_REGION}:${ACCOUNT_ID}:secret:retry-dlq/mq:username::"},
+      {"name":"SPRING_RABBITMQ_PASSWORD","valueFrom":"arn:aws:secretsmanager:${AWS_REGION}:${ACCOUNT_ID}:secret:retry-dlq/mq:password::"}
+    ],
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "/ecs/retry-dlq/${svc}-service",
+        "awslogs-region": "${AWS_REGION}",
+        "awslogs-stream-prefix": "ecs"
       }
     }
-  ]
+  }]
 }
 EOF
-
-aws ecs register-task-definition \
-  --cli-input-json file://payment-service-task-def.json \
-  --region $AWS_REGION
+  aws ecs register-task-definition --cli-input-json file://${svc}-task.json
+done
 ```
 
-### 5.5 Create Task Definition — invoice-service
-
-```bash
-cat > invoice-service-task-def.json << EOF
-{
-  "family": "invoice-service",
-  "networkMode": "awsvpc",
-  "requiresCompatibilities": ["FARGATE"],
-  "cpu": "256",
-  "memory": "512",
-  "executionRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/ecsTaskExecutionRole-retry-dlq",
-  "containerDefinitions": [
-    {
-      "name": "invoice-service",
-      "image": "${ECR_REGISTRY}/rabbitmq-retry-dlq/invoice-service:latest",
-      "portMappings": [{"containerPort": 8082, "protocol": "tcp"}],
-      "environment": [
-        {"name": "SPRING_DATASOURCE_URL", "value": "jdbc:postgresql://${INVOICE_DB_ENDPOINT}:5432/invoice_db"},
-        {"name": "SPRING_DATASOURCE_USERNAME", "value": "postgres"},
-        {"name": "SPRING_RABBITMQ_HOST", "value": "${MQ_ENDPOINT}"},
-        {"name": "SPRING_RABBITMQ_PORT", "value": "5671"},
-        {"name": "SPRING_RABBITMQ_SSL_ENABLED", "value": "true"},
-        {"name": "SPRING_RABBITMQ_LISTENER_SIMPLE_DEFAULT_REQUEUE_REJECTED", "value": "false"},
-        {"name": "APP_RETRY_INVOICE_MAX_ATTEMPTS", "value": "3"},
-        {"name": "APP_RETRY_INVOICE_DELAY", "value": "1000"},
-        {"name": "APP_RETRY_INVOICE_MULTIPLIER", "value": "1.0"},
-        {"name": "APP_RETRY_INVOICE_MAX_DELAY", "value": "1000"}
-      ],
-      "secrets": [
-        {"name": "SPRING_DATASOURCE_PASSWORD", "valueFrom": "arn:aws:secretsmanager:${AWS_REGION}:${ACCOUNT_ID}:secret:rabbitmq-retry-dlq/invoice-db-password:password::"},
-        {"name": "SPRING_RABBITMQ_USERNAME", "valueFrom": "arn:aws:secretsmanager:${AWS_REGION}:${ACCOUNT_ID}:secret:rabbitmq-retry-dlq/mq-credentials:username::"},
-        {"name": "SPRING_RABBITMQ_PASSWORD", "valueFrom": "arn:aws:secretsmanager:${AWS_REGION}:${ACCOUNT_ID}:secret:rabbitmq-retry-dlq/mq-credentials:password::"}
-      ],
-      "logConfiguration": {
-        "logDriver": "awslogs",
-        "options": {
-          "awslogs-group": "/ecs/rabbitmq-retry-dlq/invoice-service",
-          "awslogs-region": "${AWS_REGION}",
-          "awslogs-stream-prefix": "ecs",
-          "awslogs-create-group": "true"
-        }
-      }
-    }
-  ]
-}
-EOF
-
-aws ecs register-task-definition \
-  --cli-input-json file://invoice-service-task-def.json \
-  --region $AWS_REGION
-```
-
-### 5.6 Create the Load Balancer and Target Groups
-
-These must exist before the ECS services, because each service registers itself with its target group on creation.
-
-```bash
-# Create the ALB
-export ALB_ARN=$(aws elbv2 create-load-balancer \
-  --name rabbitmq-retry-dlq-alb \
-  --subnets $SUBNET_1 $SUBNET_2 \
-  --security-groups $ALB_SG_ID \
-  --scheme internet-facing \
-  --type application \
-  --query 'LoadBalancers[0].LoadBalancerArn' --output text --region $AWS_REGION)
-echo "ALB_ARN=$ALB_ARN"
-
-# payment-service target group
-export PAYMENT_TG_ARN=$(aws elbv2 create-target-group \
-  --name payment-service-tg \
-  --protocol HTTP --port 8081 \
-  --vpc-id $VPC_ID --target-type ip \
-  --health-check-path /actuator/health \
-  --query 'TargetGroups[0].TargetGroupArn' --output text --region $AWS_REGION)
-
-# invoice-service target group
-export INVOICE_TG_ARN=$(aws elbv2 create-target-group \
-  --name invoice-service-tg \
-  --protocol HTTP --port 8082 \
-  --vpc-id $VPC_ID --target-type ip \
-  --health-check-path /actuator/health \
-  --query 'TargetGroups[0].TargetGroupArn' --output text --region $AWS_REGION)
-
-echo "PAYMENT_TG_ARN=$PAYMENT_TG_ARN"
-echo "INVOICE_TG_ARN=$INVOICE_TG_ARN"
-```
-
-> ⚠️ **Health check requires Spring Boot Actuator.** The target groups above use `/actuator/health`. If `spring-boot-starter-actuator` is **not** in each service's `pom.xml`, the health checks return 404, the targets never become healthy, and **ECS will kill and restart the tasks in an endless loop**. Either:
-> - add the Actuator dependency (recommended — one line in `pom.xml`), or
-> - change `--health-check-path` to a real endpoint that returns 200, e.g. `/api/v1/valid/payments` for payment-service and `/api/v1/invoices` for invoice-service.
->
-> This is the single most common reason a "correct-looking" deployment never goes healthy.
-
-### 5.7 Create Listener and Routing Rules
-
-```bash
-# Listener on port 80 with a default 404
-export LISTENER_ARN=$(aws elbv2 create-listener \
-  --load-balancer-arn $ALB_ARN \
-  --protocol HTTP --port 80 \
-  --default-actions Type=fixed-response,FixedResponseConfig='{MessageBody=Not Found,StatusCode=404,ContentType=text/plain}' \
-  --query 'Listeners[0].ListenerArn' --output text --region $AWS_REGION)
-echo "LISTENER_ARN=$LISTENER_ARN"
-
-# Route valid payment endpoints to payment-service
-aws elbv2 create-rule \
-  --listener-arn $LISTENER_ARN --priority 10 \
-  --conditions Field=path-pattern,Values='/api/v1/valid/payments*' \
-  --actions Type=forward,TargetGroupArn=$PAYMENT_TG_ARN --region $AWS_REGION
-
-# Route malformed payment endpoints to payment-service
-aws elbv2 create-rule \
-  --listener-arn $LISTENER_ARN --priority 20 \
-  --conditions Field=path-pattern,Values='/api/v1/malformed/*' \
-  --actions Type=forward,TargetGroupArn=$PAYMENT_TG_ARN --region $AWS_REGION
-
-# Route invoice endpoints to invoice-service
-aws elbv2 create-rule \
-  --listener-arn $LISTENER_ARN --priority 30 \
-  --conditions Field=path-pattern,Values='/api/v1/invoices*' \
-  --actions Type=forward,TargetGroupArn=$INVOICE_TG_ARN --region $AWS_REGION
-```
-
-### 5.8 Create ECS Services
-
-```bash
-# payment-service
-aws ecs create-service \
-  --cluster rabbitmq-retry-dlq-cluster \
-  --service-name payment-service \
-  --task-definition payment-service \
-  --desired-count 1 \
-  --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1,$SUBNET_2],securityGroups=[$ECS_SG_ID],assignPublicIp=ENABLED}" \
-  --load-balancers "targetGroupArn=$PAYMENT_TG_ARN,containerName=payment-service,containerPort=8081" \
-  --region $AWS_REGION
-
-# invoice-service
-aws ecs create-service \
-  --cluster rabbitmq-retry-dlq-cluster \
-  --service-name invoice-service \
-  --task-definition invoice-service \
-  --desired-count 1 \
-  --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1,$SUBNET_2],securityGroups=[$ECS_SG_ID],assignPublicIp=ENABLED}" \
-  --load-balancers "targetGroupArn=$INVOICE_TG_ARN,containerName=invoice-service,containerPort=8082" \
-  --region $AWS_REGION
-```
-
-> `assignPublicIp=ENABLED` is required here because the tasks run in public subnets and need outbound internet access to pull the image from ECR and read from Secrets Manager. The tasks are still protected — the ECS security group only accepts inbound traffic from the ALB.
+> The `_PLACEHOLDER` entry just lets the optional `EXTRA` block end with a comma cleanly. Harmless — Spring ignores unknown env vars.
 
 ---
 
-## Phase 6 — GitHub Actions: CI/CD Pipeline
+## Phase 7 — Load Balancer & Services
 
-Create `.github/workflows/deploy.yml` in your repository:
+### 7.1 ALB and target groups
+
+```bash
+export ALB_ARN=$(aws elbv2 create-load-balancer --name retry-dlq-alb \
+  --subnets $SUBNET_1 $SUBNET_2 --security-groups $ALB_SG \
+  --scheme internet-facing --type application \
+  --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+
+export PAY_TG=$(aws elbv2 create-target-group --name payment-tg \
+  --protocol HTTP --port 8081 --vpc-id $VPC_ID --target-type ip \
+  --health-check-path /actuator/health \
+  --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+export INV_TG=$(aws elbv2 create-target-group --name invoice-tg \
+  --protocol HTTP --port 8082 --vpc-id $VPC_ID --target-type ip \
+  --health-check-path /actuator/health \
+  --query 'TargetGroups[0].TargetGroupArn' --output text)
+```
+
+> ⚠️ **Health checks need Spring Boot Actuator.** Target groups check `/actuator/health`. If `spring-boot-starter-actuator` is missing from a service's `pom.xml`, health checks return 404, targets never go healthy, and **ECS restarts the tasks forever**. Either add the dependency, or change `--health-check-path` to a real 200 endpoint (`/api/v1/valid/payments` and `/api/v1/invoices`). This is the most common cause of a stuck deployment.
+
+### 7.2 Listener and routing rules
+
+```bash
+export LISTENER=$(aws elbv2 create-listener --load-balancer-arn $ALB_ARN \
+  --protocol HTTP --port 80 \
+  --default-actions Type=fixed-response,FixedResponseConfig='{StatusCode=404,ContentType=text/plain,MessageBody=Not Found}' \
+  --query 'Listeners[0].ListenerArn' --output text)
+
+aws elbv2 create-rule --listener-arn $LISTENER --priority 10 \
+  --conditions Field=path-pattern,Values='/api/v1/valid/payments*' \
+  --actions Type=forward,TargetGroupArn=$PAY_TG
+aws elbv2 create-rule --listener-arn $LISTENER --priority 20 \
+  --conditions Field=path-pattern,Values='/api/v1/malformed/*' \
+  --actions Type=forward,TargetGroupArn=$PAY_TG
+aws elbv2 create-rule --listener-arn $LISTENER --priority 30 \
+  --conditions Field=path-pattern,Values='/api/v1/invoices*' \
+  --actions Type=forward,TargetGroupArn=$INV_TG
+```
+
+### 7.3 Create the services
+
+```bash
+aws ecs create-service --cluster retry-dlq --service-name payment-service \
+  --task-definition payment-service --desired-count 1 --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1,$SUBNET_2],securityGroups=[$ECS_SG],assignPublicIp=ENABLED}" \
+  --load-balancers "targetGroupArn=$PAY_TG,containerName=payment-service,containerPort=8081"
+
+aws ecs create-service --cluster retry-dlq --service-name invoice-service \
+  --task-definition invoice-service --desired-count 1 --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1,$SUBNET_2],securityGroups=[$ECS_SG],assignPublicIp=ENABLED}" \
+  --load-balancers "targetGroupArn=$INV_TG,containerName=invoice-service,containerPort=8082"
+```
+
+**Verify:** get the public URL, then test it once the tasks are healthy (1-2 minutes).
+
+```bash
+aws elbv2 describe-load-balancers --names retry-dlq-alb --query 'LoadBalancers[0].DNSName' --output text
+# curl http://<that-dns>/api/v1/valid/payments
+```
+
+| Endpoint | Path |
+|---|---|
+| Create payment | `POST /api/v1/valid/payments` |
+| Publish malformed | `POST /api/v1/malformed/payments/payment-completed` |
+| List invoices | `GET /api/v1/invoices` |
+
+---
+
+## Phase 8 — CI/CD (GitHub Actions)
+
+Add `.github/workflows/deploy.yml`:
 
 ```yaml
-name: Build and Deploy to AWS ECS
-
+name: Deploy to ECS
 on:
   push:
-    branches:
-      - main
-
+    branches: [main]
 env:
   AWS_REGION: eu-west-1
-  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-west-1.amazonaws.com
-  ECS_CLUSTER: rabbitmq-retry-dlq-cluster
-
 jobs:
   deploy:
-    name: Build, Push, Deploy
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Java 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: 'temurin'
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build and push payment-service
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+      - name: Build, push, deploy
+        env:
+          REG: ${{ steps.ecr.outputs.registry }}
         run: |
-          docker build -t $ECR_REGISTRY/rabbitmq-retry-dlq/payment-service:${{ github.sha }} ./payment-service
-          docker push $ECR_REGISTRY/rabbitmq-retry-dlq/payment-service:${{ github.sha }}
-          docker tag $ECR_REGISTRY/rabbitmq-retry-dlq/payment-service:${{ github.sha }} \
-            $ECR_REGISTRY/rabbitmq-retry-dlq/payment-service:latest
-          docker push $ECR_REGISTRY/rabbitmq-retry-dlq/payment-service:latest
-
-      - name: Build and push invoice-service
-        run: |
-          docker build -t $ECR_REGISTRY/rabbitmq-retry-dlq/invoice-service:${{ github.sha }} ./invoice-service
-          docker push $ECR_REGISTRY/rabbitmq-retry-dlq/invoice-service:${{ github.sha }}
-          docker tag $ECR_REGISTRY/rabbitmq-retry-dlq/invoice-service:${{ github.sha }} \
-            $ECR_REGISTRY/rabbitmq-retry-dlq/invoice-service:latest
-          docker push $ECR_REGISTRY/rabbitmq-retry-dlq/invoice-service:latest
-
-      - name: Deploy payment-service to ECS
-        run: |
-          aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service payment-service \
-            --force-new-deployment \
-            --region $AWS_REGION
-
-      - name: Deploy invoice-service to ECS
-        run: |
-          aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service invoice-service \
-            --force-new-deployment \
-            --region $AWS_REGION
+          for svc in payment invoice; do
+            docker build -t $REG/retry-dlq/$svc-service:${{ github.sha }} ./$svc-service
+            docker push  $REG/retry-dlq/$svc-service:${{ github.sha }}
+            docker tag   $REG/retry-dlq/$svc-service:${{ github.sha }} $REG/retry-dlq/$svc-service:latest
+            docker push  $REG/retry-dlq/$svc-service:latest
+            aws ecs update-service --cluster retry-dlq --service $svc-service --force-new-deployment
+          done
 ```
 
-### GitHub Actions Secrets to Configure
-
-Go to your repository → Settings → Secrets and variables → Actions, and add:
-
-| Secret | Value |
-|---|---|
-| `AWS_ACCESS_KEY_ID` | IAM user access key |
-| `AWS_SECRET_ACCESS_KEY` | IAM user secret key |
-| `AWS_ACCOUNT_ID` | Your 12-digit AWS account ID |
+Add these repository secrets under **Settings → Secrets and variables → Actions**: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
 
 ---
 
-## Service URLs After Deployment
-
-Retrieve the ALB DNS name:
+## Logs
 
 ```bash
-aws elbv2 describe-load-balancers \
-  --names rabbitmq-retry-dlq-alb \
-  --query 'LoadBalancers[0].DNSName' --output text --region $AWS_REGION
+aws logs tail /ecs/retry-dlq/payment-service --follow
+aws logs tail /ecs/retry-dlq/invoice-service --follow
 ```
-
-| Service | URL |
-|---|---|
-| payment-service | `http://<alb-dns>/api/v1/valid/payments` |
-| payment-service (malformed) | `http://<alb-dns>/api/v1/malformed/payments/payment-completed` |
-| invoice-service | `http://<alb-dns>/api/v1/invoices` |
-| RabbitMQ Management UI | Amazon MQ Console URL (port 443) — see `BrokerInstances[0].ConsoleURL` |
-
----
-
-## CloudWatch Logs
-
-Application logs stream to CloudWatch via the `awslogs` driver configured in the task definitions.
-
-```bash
-# payment-service logs
-aws logs tail /ecs/rabbitmq-retry-dlq/payment-service --follow --region $AWS_REGION
-
-# invoice-service logs
-aws logs tail /ecs/rabbitmq-retry-dlq/invoice-service --follow --region $AWS_REGION
-```
-
-Or open the AWS Console → CloudWatch → Log groups → `/ecs/rabbitmq-retry-dlq/`.
-
-This replaces the local `docker logs` workflow and gives you visibility into retry attempts, DLQ routing, and consumer behavior in a real cloud environment.
-
----
 
 ## Troubleshooting
 
-| Symptom | Likely cause |
+| Symptom | Cause |
 |---|---|
-| Tasks start then stop repeatedly | Health check failing — Actuator missing or wrong health-check path (see 5.6) |
-| Task stuck in `PENDING`, never `RUNNING` | Tasks can't reach ECR/Secrets Manager — check `assignPublicIp=ENABLED` and the ECS security group |
-| `ResourceInitializationError: unable to pull secrets` | Execution role missing the secrets policy (5.3), or secret ARN/key name mismatch |
-| App logs show RabbitMQ connection refused | `SPRING_RABBITMQ_SSL_ENABLED` not set to `true`, or MQ security group not allowing 5671 from ECS |
-| App logs show DB connection timeout | RDS security group not allowing 5432 from the ECS security group |
-| ALB returns 503 | No healthy targets yet — check target group health in the console |
+| Tasks start then stop in a loop | Health check failing — Actuator missing or wrong path (7.1) |
+| Task stuck `PENDING` | Can't reach ECR/Secrets — confirm `assignPublicIp=ENABLED` |
+| `unable to pull secrets` | Execution role missing secrets policy, or secret name mismatch |
+| RabbitMQ connection refused | `SPRING_RABBITMQ_SSL_ENABLED` not `true`, or MQ SG rule missing |
+| DB connection timeout | RDS SG not allowing 5432 from the ECS SG |
+| ALB returns 503 | No healthy targets yet — check target group health |
+
+---
+
+## Resuming Later
+
+Shell variables are lost when you close the terminal. In a new Git Bash window, re-run the [Before You Start](#before-you-start) exports plus this lookup block to restore everything from resources that already exist:
+
+```bash
+export VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query 'Vpcs[0].VpcId' --output text)
+export SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[0:2].SubnetId' --output text)
+export SUBNET_1=$(echo $SUBNETS | cut -d' ' -f1); export SUBNET_2=$(echo $SUBNETS | cut -d' ' -f2)
+g () { aws ec2 describe-security-groups --filters "Name=group-name,Values=$1" "Name=vpc-id,Values=$VPC_ID" --query 'SecurityGroups[0].GroupId' --output text; }
+export ALB_SG=$(g retry-dlq-alb-sg); export ECS_SG=$(g retry-dlq-ecs-sg)
+export RDS_SG=$(g retry-dlq-rds-sg); export MQ_SG=$(g retry-dlq-mq-sg)
+```
 
 ---
 
 ## Teardown
 
-When you are done, remove all resources to avoid ongoing charges. Order matters — services before their dependencies.
+Remove everything to stop charges (RDS and Amazon MQ are the costly ones).
 
 ```bash
-# 1. Scale down and delete ECS services
-aws ecs update-service --cluster rabbitmq-retry-dlq-cluster --service payment-service --desired-count 0 --region $AWS_REGION
-aws ecs update-service --cluster rabbitmq-retry-dlq-cluster --service invoice-service --desired-count 0 --region $AWS_REGION
-aws ecs delete-service --cluster rabbitmq-retry-dlq-cluster --service payment-service --force --region $AWS_REGION
-aws ecs delete-service --cluster rabbitmq-retry-dlq-cluster --service invoice-service --force --region $AWS_REGION
+aws ecs update-service --cluster retry-dlq --service payment-service --desired-count 0
+aws ecs update-service --cluster retry-dlq --service invoice-service --desired-count 0
+aws ecs delete-service --cluster retry-dlq --service payment-service --force
+aws ecs delete-service --cluster retry-dlq --service invoice-service --force
+aws ecs delete-cluster --cluster retry-dlq
 
-# 2. Delete the ECS cluster
-aws ecs delete-cluster --cluster rabbitmq-retry-dlq-cluster --region $AWS_REGION
+aws elbv2 delete-load-balancer --load-balancer-arn $ALB_ARN; sleep 30
+aws elbv2 delete-target-group --target-group-arn $PAY_TG
+aws elbv2 delete-target-group --target-group-arn $INV_TG
 
-# 3. Delete ALB listener rules, listener, ALB, and target groups
-aws elbv2 delete-load-balancer --load-balancer-arn $ALB_ARN --region $AWS_REGION
-# wait for the ALB to finish deleting before removing target groups
-sleep 30
-aws elbv2 delete-target-group --target-group-arn $PAYMENT_TG_ARN --region $AWS_REGION
-aws elbv2 delete-target-group --target-group-arn $INVOICE_TG_ARN --region $AWS_REGION
+aws mq delete-broker --broker-id $BROKER_ID
+aws rds delete-db-instance --db-instance-identifier payment-db --skip-final-snapshot
+aws rds delete-db-instance --db-instance-identifier invoice-db --skip-final-snapshot
 
-# 4. Delete Amazon MQ broker
-aws mq delete-broker --broker-id $BROKER_ID --region $AWS_REGION
+aws ecr delete-repository --repository-name retry-dlq/payment-service --force
+aws ecr delete-repository --repository-name retry-dlq/invoice-service --force
 
-# 5. Delete RDS instances
-aws rds delete-db-instance --db-instance-identifier payment-db --skip-final-snapshot --region $AWS_REGION
-aws rds delete-db-instance --db-instance-identifier invoice-db --skip-final-snapshot --region $AWS_REGION
+aws secretsmanager delete-secret --secret-id retry-dlq/payment-db --force-delete-without-recovery
+aws secretsmanager delete-secret --secret-id retry-dlq/invoice-db --force-delete-without-recovery
+aws secretsmanager delete-secret --secret-id retry-dlq/mq --force-delete-without-recovery
 
-# 6. Delete ECR repositories
-aws ecr delete-repository --repository-name rabbitmq-retry-dlq/payment-service --force --region $AWS_REGION
-aws ecr delete-repository --repository-name rabbitmq-retry-dlq/invoice-service --force --region $AWS_REGION
+aws logs delete-log-group --log-group-name /ecs/retry-dlq/payment-service
+aws logs delete-log-group --log-group-name /ecs/retry-dlq/invoice-service
 
-# 7. Delete Secrets Manager secrets
-aws secretsmanager delete-secret --secret-id rabbitmq-retry-dlq/payment-db-password --force-delete-without-recovery --region $AWS_REGION
-aws secretsmanager delete-secret --secret-id rabbitmq-retry-dlq/invoice-db-password --force-delete-without-recovery --region $AWS_REGION
-aws secretsmanager delete-secret --secret-id rabbitmq-retry-dlq/mq-credentials --force-delete-without-recovery --region $AWS_REGION
+# Security groups only delete after RDS/MQ are fully gone (wait a few minutes)
+aws ec2 delete-security-group --group-id $ECS_SG
+aws ec2 delete-security-group --group-id $RDS_SG
+aws ec2 delete-security-group --group-id $MQ_SG
+aws ec2 delete-security-group --group-id $ALB_SG
 
-# 8. Delete CloudWatch log groups
-aws logs delete-log-group --log-group-name /ecs/rabbitmq-retry-dlq/payment-service --region $AWS_REGION
-aws logs delete-log-group --log-group-name /ecs/rabbitmq-retry-dlq/invoice-service --region $AWS_REGION
-
-# 9. Delete security groups (only after the resources using them are gone)
-#    RDS and MQ take several minutes to delete; wait before removing their SGs.
-aws ec2 delete-security-group --group-id $ECS_SG_ID --region $AWS_REGION
-aws ec2 delete-security-group --group-id $RDS_SG_ID --region $AWS_REGION
-aws ec2 delete-security-group --group-id $MQ_SG_ID --region $AWS_REGION
-aws ec2 delete-security-group --group-id $ALB_SG_ID --region $AWS_REGION
-
-# 10. Delete the IAM role and policy
-aws iam detach-role-policy --role-name ecsTaskExecutionRole-retry-dlq --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-aws iam detach-role-policy --role-name ecsTaskExecutionRole-retry-dlq --policy-arn $SECRETS_POLICY_ARN
-aws iam delete-role --role-name ecsTaskExecutionRole-retry-dlq
-aws iam delete-policy --policy-arn $SECRETS_POLICY_ARN
+aws iam detach-role-policy --role-name retry-dlq-exec --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+aws iam detach-role-policy --role-name retry-dlq-exec --policy-arn $SECRETS_POLICY
+aws iam delete-role --role-name retry-dlq-exec
+aws iam delete-policy --policy-arn $SECRETS_POLICY
 ```
-
-> Always verify in the AWS Console that all resources are removed, especially RDS instances and the Amazon MQ broker, as they are the most expensive components. Security group deletion will fail if any resource is still attached — wait for RDS/MQ to fully delete first.
 
 ---
 
-## Production-Grade Alternative (Not Required for This Demo)
+## Production Notes (Out of Scope Here)
 
-This guide uses public subnets to avoid NAT gateway cost. For a production setup you would instead:
-
-- Place ECS tasks and RDS in **private subnets** (`assignPublicIp=DISABLED`).
-- Add a **NAT gateway** for outbound access, or use **VPC endpoints** for ECR, Secrets Manager, and CloudWatch to keep traffic inside AWS.
-- Use a **dedicated DB subnet group** spanning multiple AZs.
-- Run Amazon MQ as `ACTIVE_STANDBY_MULTI_AZ` and RDS with Multi-AZ enabled.
-- Terminate TLS at the ALB with an ACM certificate (HTTPS on 443) instead of plain HTTP on 80.
+For a real deployment you would: place tasks and RDS in **private subnets** with a NAT gateway or VPC endpoints; run RDS and Amazon MQ **Multi-AZ**; terminate **TLS at the ALB** (HTTPS) with an ACM certificate; and manage all of this with **Terraform** or **CloudFormation** instead of CLI commands.
