@@ -87,33 +87,81 @@ Every phase below **captures resource IDs into shell variables** (e.g. `VPC_ID`,
 - In a real (non-default) VPC, security group rules **must** reference other groups by ID, not by name.
 - It makes the commands copy-paste safe in a single terminal session.
 
-Run all commands in the **same terminal session** so the variables persist. If you open a new terminal, re-export the IDs (each phase shows how to retrieve them).
+Run all commands in the **same terminal session** so the variables persist. If you close the terminal and come back later, the variables are gone — use the resume block below to restore them.
 
 > **Network design choice:** For simplicity and to keep this a low-cost portfolio deployment, ECS tasks and RDS run in the VPC's **public subnets** with tasks assigned public IPs. This avoids needing a NAT gateway (which costs ~$32/month) for tasks to reach ECR and Secrets Manager. Security is still enforced by security groups — nothing is open to the internet except the ALB on port 80. The production-grade alternative (private subnets + NAT gateway or VPC endpoints) is noted at the end.
+
+### Resuming in a New Terminal Session
+
+Exported shell variables do **not** survive closing the terminal. If you continue the deployment in a fresh Git Bash window, paste this block first to restore every variable by looking up resources that already exist. It is safe to run at any point — it only reads, never creates.
+
+```bash
+export AWS_REGION=eu-west-1
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export ECR_REGISTRY=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+# VPC + subnets
+export VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" \
+  --query 'Vpcs[0].VpcId' --output text --region $AWS_REGION)
+export SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" \
+  --query 'Subnets[0:2].SubnetId' --output text --region $AWS_REGION)
+export SUBNET_1=$(echo $SUBNET_IDS | awk '{print $1}')
+export SUBNET_2=$(echo $SUBNET_IDS | awk '{print $2}')
+
+# Security groups (by name)
+sg_id () { aws ec2 describe-security-groups \
+  --filters "Name=group-name,Values=$1" "Name=vpc-id,Values=$VPC_ID" \
+  --query 'SecurityGroups[0].GroupId' --output text --region $AWS_REGION; }
+export ALB_SG_ID=$(sg_id retry-dlq-alb-sg)
+export ECS_SG_ID=$(sg_id retry-dlq-ecs-sg)
+export RDS_SG_ID=$(sg_id retry-dlq-rds-sg)
+export MQ_SG_ID=$(sg_id retry-dlq-mq-sg)
+
+# RDS + MQ endpoints (only resolve once those resources exist; otherwise blank)
+export PAYMENT_DB_ENDPOINT=$(aws rds describe-db-instances --db-instance-identifier payment-db \
+  --query 'DBInstances[0].Endpoint.Address' --output text --region $AWS_REGION 2>/dev/null)
+export INVOICE_DB_ENDPOINT=$(aws rds describe-db-instances --db-instance-identifier invoice-db \
+  --query 'DBInstances[0].Endpoint.Address' --output text --region $AWS_REGION 2>/dev/null)
+export BROKER_ID=$(aws mq list-brokers \
+  --query "BrokerSummaries[?BrokerName=='rabbitmq-retry-dlq-broker'].BrokerId" \
+  --output text --region $AWS_REGION 2>/dev/null)
+
+echo "Restored. VPC, subnets, and SG variables should now be set."
+```
+
+Verify nothing came back empty (prints `ok` / `EMPTY` only, reveals no IDs):
+
+```bash
+for v in AWS_REGION VPC_ID SUBNET_1 SUBNET_2 ALB_SG_ID ECS_SG_ID RDS_SG_ID MQ_SG_ID; do
+  eval "val=\$$v"; [ -n "$val" ] && echo "$v ok" || echo "$v EMPTY"
+done
+```
+
+`PAYMENT_DB_ENDPOINT`, `INVOICE_DB_ENDPOINT`, and `BROKER_ID` will be empty until you have completed Phases 2 and 3 — that is expected if you are resuming earlier than those phases.
 
 ---
 
 ## Phase 0 — Networking & Security Groups
- 
+
 This phase creates all four security groups first, then adds their rules. Run every command from here on in **Git Bash**, keeping the same terminal session open so the exported variables persist.
- 
+
 ### 0.1 Capture VPC and Subnets
- 
+
 ```bash
 export AWS_REGION=eu-west-1
- 
+
 # Default VPC
 export VPC_ID=$(aws ec2 describe-vpcs \
   --filters "Name=isDefault,Values=true" \
   --query 'Vpcs[0].VpcId' --output text --region $AWS_REGION)
 echo "VPC_ID=$VPC_ID"
- 
+
 # Two subnets in different AZs (ALB requires at least two)
 export SUBNET_IDS=$(aws ec2 describe-subnets \
   --filters "Name=vpc-id,Values=$VPC_ID" \
   --query 'Subnets[0:2].SubnetId' --output text --region $AWS_REGION)
 echo "SUBNET_IDS=$SUBNET_IDS"
- 
+
 # Split into individual variables for later use
 export SUBNET_1=$(echo $SUBNET_IDS | awk '{print $1}')
 export SUBNET_2=$(echo $SUBNET_IDS | awk '{print $2}')
@@ -122,30 +170,27 @@ echo "SUBNET_1=$SUBNET_1  SUBNET_2=$SUBNET_2"
 
 ### 0.2 Create All Security Groups (empty)
 
+The helper below creates a group only if one with that name does not already exist, and returns its ID either way. This makes the step **safe to re-run** — running it twice will not create duplicate groups.
+
 ```bash
-# ALB security group
-export ALB_SG_ID=$(aws ec2 create-security-group \
-  --group-name retry-dlq-alb-sg \
-  --description "ALB for rabbitmq-retry-dlq" \
-  --vpc-id $VPC_ID --query 'GroupId' --output text --region $AWS_REGION)
+# Helper: get the ID of a security group by name, or create it if missing
+ensure_sg () {
+  local name="$1" desc="$2" id
+  id=$(aws ec2 describe-security-groups \
+        --filters "Name=group-name,Values=$name" "Name=vpc-id,Values=$VPC_ID" \
+        --query 'SecurityGroups[0].GroupId' --output text --region $AWS_REGION 2>/dev/null)
+  if [ "$id" = "None" ] || [ -z "$id" ]; then
+    id=$(aws ec2 create-security-group \
+          --group-name "$name" --description "$desc" \
+          --vpc-id $VPC_ID --query 'GroupId' --output text --region $AWS_REGION)
+  fi
+  echo "$id"
+}
 
-# ECS tasks security group
-export ECS_SG_ID=$(aws ec2 create-security-group \
-  --group-name retry-dlq-ecs-sg \
-  --description "ECS tasks for rabbitmq-retry-dlq" \
-  --vpc-id $VPC_ID --query 'GroupId' --output text --region $AWS_REGION)
-
-# RDS security group
-export RDS_SG_ID=$(aws ec2 create-security-group \
-  --group-name retry-dlq-rds-sg \
-  --description "RDS for rabbitmq-retry-dlq" \
-  --vpc-id $VPC_ID --query 'GroupId' --output text --region $AWS_REGION)
-
-# Amazon MQ security group
-export MQ_SG_ID=$(aws ec2 create-security-group \
-  --group-name retry-dlq-mq-sg \
-  --description "Amazon MQ for rabbitmq-retry-dlq" \
-  --vpc-id $VPC_ID --query 'GroupId' --output text --region $AWS_REGION)
+export ALB_SG_ID=$(ensure_sg retry-dlq-alb-sg "ALB for rabbitmq-retry-dlq")
+export ECS_SG_ID=$(ensure_sg retry-dlq-ecs-sg "ECS tasks for rabbitmq-retry-dlq")
+export RDS_SG_ID=$(ensure_sg retry-dlq-rds-sg "RDS for rabbitmq-retry-dlq")
+export MQ_SG_ID=$(ensure_sg  retry-dlq-mq-sg  "Amazon MQ for rabbitmq-retry-dlq")
 
 echo "ALB_SG_ID=$ALB_SG_ID"
 echo "ECS_SG_ID=$ECS_SG_ID"
@@ -153,7 +198,11 @@ echo "RDS_SG_ID=$RDS_SG_ID"
 echo "MQ_SG_ID=$MQ_SG_ID"
 ```
 
+All four lines should print a `sg-...` value. If any prints `None` or is blank, stop and re-check `$VPC_ID` before continuing.
+
 ### 0.3 Add Security Group Rules
+
+If you re-run any of these and the rule already exists, AWS returns an `InvalidPermission.Duplicate` error for that line and changes nothing — that is harmless.
 
 ```bash
 # ALB: allow HTTP from the internet
@@ -175,8 +224,18 @@ aws ec2 authorize-security-group-ingress \
   --group-id $MQ_SG_ID --protocol tcp --port 5671 --source-group $ECS_SG_ID --region $AWS_REGION
 ```
 
-> If you open a new terminal later, retrieve any group ID with:
-> `aws ec2 describe-security-groups --filters "Name=group-name,Values=retry-dlq-ecs-sg" --query 'SecurityGroups[0].GroupId' --output text`
+### 0.4 Verify the Rules
+
+Confirm each group has the expected port before moving on:
+
+```bash
+echo "ALB (expect 80):   $(aws ec2 describe-security-groups --group-ids $ALB_SG_ID --query 'SecurityGroups[0].IpPermissions[].FromPort' --output text --region $AWS_REGION)"
+echo "ECS (expect 8081 8082): $(aws ec2 describe-security-groups --group-ids $ECS_SG_ID --query 'SecurityGroups[0].IpPermissions[].FromPort' --output text --region $AWS_REGION)"
+echo "RDS (expect 5432): $(aws ec2 describe-security-groups --group-ids $RDS_SG_ID --query 'SecurityGroups[0].IpPermissions[].FromPort' --output text --region $AWS_REGION)"
+echo "MQ  (expect 5671): $(aws ec2 describe-security-groups --group-ids $MQ_SG_ID --query 'SecurityGroups[0].IpPermissions[].FromPort' --output text --region $AWS_REGION)"
+```
+
+If a line shows its expected port(s), that group is correctly configured. A blank value means the rule did not apply — re-run the matching command in 0.3 (and check that the variable is not empty with `echo $ECS_SG_ID`).
 
 ---
 
