@@ -87,8 +87,6 @@ Every phase below **captures resource IDs into shell variables** (e.g. `VPC_ID`,
 - In a real (non-default) VPC, security group rules **must** reference other groups by ID, not by name.
 - It makes the commands copy-paste safe in a single terminal session.
 
-Run all commands in the **same terminal session** so the variables persist. If you close the terminal and come back later, the variables are gone — use the resume block below to restore them.
-
 > **Network design choice:** For simplicity and to keep this a low-cost portfolio deployment, ECS tasks and RDS run in the VPC's **public subnets** with tasks assigned public IPs. This avoids needing a NAT gateway (which costs ~$32/month) for tasks to reach ECR and Secrets Manager. Security is still enforced by security groups — nothing is open to the internet except the ALB on port 80. The production-grade alternative (private subnets + NAT gateway or VPC endpoints) is noted at the end.
 
 ### Resuming in a New Terminal Session
@@ -143,7 +141,7 @@ done
 
 ## Phase 0 — Networking & Security Groups
 
-This phase creates all four security groups first, then adds their rules. Run every command from here on in **Git Bash**, keeping the same terminal session open so the exported variables persist.
+This phase creates all four security groups first, then adds their rules.
 
 ### 0.1 Capture VPC and Subnets
 
